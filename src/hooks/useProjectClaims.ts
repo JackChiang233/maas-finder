@@ -186,7 +186,7 @@ export function useGlobalSearch(search: string) {
           supabase
             .from("github_projects")
             .select("*")
-            .or(`full_name.ilike.%${term}%,description.ilike.%${term}%`)
+            .or(`full_name.ilike.*${term}*,description.ilike.*${term}*`)
             .order("stars", { ascending: false })
             .limit(100),
           supabase
