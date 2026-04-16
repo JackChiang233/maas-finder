@@ -73,6 +73,15 @@ const ALL_COMPETITORS = [...new Set([
   ...INTL_COMPETITORS,
 ])]
 
+// ── Qiniu exclusion list ─────────────────────────────────────────────────────
+// If the project already mentions Qiniu MaaS by name, it is already integrated
+// and is not a new outreach target. Both the ASCII brand name and the Chinese
+// characters are checked since community projects may use either form.
+const QINIU_TERMS = [
+  'qiniu',   // official romanization used in SDK names, docs, URLs
+  '七牛',    // Chinese brand name (appears in README of Chinese-first projects)
+]
+
 // Brand canonicalization — `zhipuai` + `zhipu` both map to "zhipu", so they
 // only count once toward the ≥2 threshold.
 function canonicalBrand(term: string): string {
@@ -192,6 +201,15 @@ function scanCompetitors(haystack: string): CompetitorMatch {
   }
 }
 
+/**
+ * Returns true if the project already mentions Qiniu by name, meaning it has
+ * been integrated and should NOT be surfaced as a new outreach candidate.
+ */
+function hasQiniuAlready(haystack: string): boolean {
+  const lower = haystack.toLowerCase()
+  return QINIU_TERMS.some(t => lower.includes(t.toLowerCase()))
+}
+
 Deno.serve(async (req) => {
   if (req.method === 'OPTIONS') {
     return new Response(null, { status: 200, headers: corsHeaders })
@@ -231,6 +249,7 @@ Deno.serve(async (req) => {
     let accepted = 0
     let skippedExisting = 0
     let singleHitRejected = 0
+    let qiniuAlreadySkipped = 0
     let inserted = 0
 
     for (const repo of allRepos.values()) {
@@ -250,6 +269,13 @@ Deno.serve(async (req) => {
       // ≥2 distinct competitor brands required (Leader-proposed patch).
       if (match.hit_count < MIN_COMPETITOR_HITS) {
         if (match.hit_count === 1) singleHitRejected++
+        continue
+      }
+
+      // Exclude projects that already mention Qiniu — already integrated,
+      // not a new outreach target.
+      if (hasQiniuAlready(haystack)) {
+        qiniuAlreadySkipped++
         continue
       }
 
@@ -300,6 +326,7 @@ Deno.serve(async (req) => {
       scanned,
       accepted,
       single_hit_rejected: singleHitRejected,
+      qiniu_already_skipped: qiniuAlreadySkipped,
       skipped_existing: skippedExisting,
       inserted,
       rule: 'competitor-sourcing',
