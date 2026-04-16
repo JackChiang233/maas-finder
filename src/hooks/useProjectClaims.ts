@@ -167,6 +167,60 @@ export function useSubmitPr() {
   });
 }
 
+export type GlobalSearchStatus = "available" | ClaimStatus;
+
+export interface ProjectWithGlobalStatus extends ProjectWithClaim {
+  globalStatus: GlobalSearchStatus;
+}
+
+export function useGlobalSearch(search: string) {
+  return useQuery({
+    queryKey: ["global-search", search],
+    queryFn: async () => {
+      if (!search.trim()) return [];
+
+      const term = search.toLowerCase();
+
+      const [{ data: projects, error: projErr }, { data: activeClaims, error: claimErr }] =
+        await Promise.all([
+          supabase
+            .from("github_projects")
+            .select("*")
+            .or(`full_name.ilike.%${term}%,description.ilike.%${term}%`)
+            .order("stars", { ascending: false })
+            .limit(100),
+          supabase
+            .from("project_claims")
+            .select("*")
+            .in("status", ["claimed", "pr_submitted", "merged"]),
+        ]);
+
+      if (projErr) throw projErr;
+      if (claimErr) throw claimErr;
+
+      const claimMap = new Map<string, ProjectClaim>();
+      for (const c of activeClaims || []) {
+        const existing = claimMap.get(c.project_id);
+        const priority: Record<string, number> = { pr_submitted: 2, claimed: 1, merged: 0 };
+        if (!existing || (priority[c.status] ?? -1) > (priority[existing.status] ?? -1)) {
+          claimMap.set(c.project_id, c as ProjectClaim);
+        }
+      }
+
+      return (projects || []).map((p): ProjectWithGlobalStatus => {
+        const claim = claimMap.get(p.id) ?? null;
+        let globalStatus: GlobalSearchStatus = "available";
+        if (claim) {
+          globalStatus = claim.status as ClaimStatus;
+        }
+        return { ...p, claim, globalStatus };
+      });
+    },
+    enabled: search.trim().length > 0,
+    staleTime: 15 * 1000,
+  });
+}
+
 export function useClaimCounts() {
   return useQuery({
     queryKey: ["claim-counts"],

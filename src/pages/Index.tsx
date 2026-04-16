@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useProjectStats, type ProjectFilters } from "@/hooks/useGithubProjects";
-import { useProjectsWithClaims, useClaimCounts, type ProjectWithClaim } from "@/hooks/useProjectClaims";
+import { useProjectsWithClaims, useClaimCounts, useGlobalSearch, type ProjectWithClaim } from "@/hooks/useProjectClaims";
 import { useActiveInitJob, useStartInitJob, calcInitProgress } from "@/hooks/useSyncJob";
 import { ProjectTable } from "@/components/ProjectTable";
 import { ProjectFiltersBar } from "@/components/ProjectFiltersBar";
@@ -11,6 +11,7 @@ import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { RefreshCw, Database, ChartBar as BarChart3, LogOut, CirclePlus as PlusCircle, GitPullRequest, Play } from "lucide-react";
+import { GlobalSearchResults } from "@/components/GlobalSearchResults";
 import { supabase } from "@/integrations/supabase/client";
 import { useAuthContext } from "@/contexts/AuthContext";
 import { toast } from "sonner";
@@ -53,6 +54,9 @@ const Index = () => {
   const { data: claimedProjects, isLoading: claimedLoading } = useProjectsWithClaims("claimed");
   const { data: prProjects, isLoading: prLoading } = useProjectsWithClaims("pr_submitted");
   const { data: mergedProjects, isLoading: mergedLoading } = useProjectsWithClaims("merged");
+
+  const isSearching = filters.search.trim().length > 0;
+  const { data: globalSearchResults, isLoading: globalSearchLoading } = useGlobalSearch(filters.search);
 
   const handleCheckPrs = async () => {
     setCheckingPrs(true);
@@ -216,118 +220,129 @@ const Index = () => {
           </div>
         )}
 
-        <Tabs value={activeTab} onValueChange={(v) => setActiveTab(v as TabStatus)}>
-          <TabsList className="grid w-full grid-cols-4 max-w-lg">
-            <TabsTrigger value="available">可认领</TabsTrigger>
-            <TabsTrigger value="claimed">
-              已认领
-              {(claimCounts?.claimed ?? 0) > 0 && (
-                <span className="ml-1.5 text-xs bg-primary/10 text-primary rounded-full px-1.5 py-0.5">
-                  {claimCounts!.claimed}
-                </span>
-              )}
-            </TabsTrigger>
-            <TabsTrigger value="pr_submitted">
-              贡献中
-              {(claimCounts?.pr_submitted ?? 0) > 0 && (
-                <span className="ml-1.5 text-xs bg-sky-500/10 text-sky-600 rounded-full px-1.5 py-0.5">
-                  {claimCounts!.pr_submitted}
-                </span>
-              )}
-            </TabsTrigger>
-            <TabsTrigger value="merged">
-              已完成
-              {(claimCounts?.merged ?? 0) > 0 && (
-                <span className="ml-1.5 text-xs bg-emerald-500/10 text-emerald-600 rounded-full px-1.5 py-0.5">
-                  {claimCounts!.merged}
-                </span>
-              )}
-            </TabsTrigger>
-          </TabsList>
+        <div className="space-y-4">
+          <ProjectFiltersBar
+            filters={filters}
+            onChange={setFilters}
+            languages={stats?.languages || []}
+            categories={stats?.categories || []}
+          />
 
-          <TabsContent value="available" className="space-y-4 mt-4">
-            <ProjectFiltersBar
-              filters={filters}
-              onChange={setFilters}
-              languages={stats?.languages || []}
-              categories={stats?.categories || []}
+          {isSearching ? (
+            <GlobalSearchResults
+              results={globalSearchResults ?? []}
+              isLoading={globalSearchLoading}
+              search={filters.search}
+              onRequestLogin={() => setAuthDialogOpen(true)}
             />
+          ) : (
+            <Tabs value={activeTab} onValueChange={(v) => setActiveTab(v as TabStatus)}>
+              <TabsList className="grid w-full grid-cols-4 max-w-lg">
+                <TabsTrigger value="available">可认领</TabsTrigger>
+                <TabsTrigger value="claimed">
+                  已认领
+                  {(claimCounts?.claimed ?? 0) > 0 && (
+                    <span className="ml-1.5 text-xs bg-primary/10 text-primary rounded-full px-1.5 py-0.5">
+                      {claimCounts!.claimed}
+                    </span>
+                  )}
+                </TabsTrigger>
+                <TabsTrigger value="pr_submitted">
+                  贡献中
+                  {(claimCounts?.pr_submitted ?? 0) > 0 && (
+                    <span className="ml-1.5 text-xs bg-sky-500/10 text-sky-600 rounded-full px-1.5 py-0.5">
+                      {claimCounts!.pr_submitted}
+                    </span>
+                  )}
+                </TabsTrigger>
+                <TabsTrigger value="merged">
+                  已完成
+                  {(claimCounts?.merged ?? 0) > 0 && (
+                    <span className="ml-1.5 text-xs bg-emerald-500/10 text-emerald-600 rounded-full px-1.5 py-0.5">
+                      {claimCounts!.merged}
+                    </span>
+                  )}
+                </TabsTrigger>
+              </TabsList>
 
-            {availableLoading ? (
-              <div className="space-y-2">
-                {Array.from({ length: 8 }).map((_, i) => (
-                  <div key={i} className="h-12 bg-muted rounded animate-pulse" />
-                ))}
-              </div>
-            ) : availableError ? (
-              <div className="text-center py-12">
-                <p className="text-destructive">加载失败: {(availableError as Error).message}</p>
-                <Button variant="outline" onClick={() => refetchAvailable()} className="mt-4">重试</Button>
-              </div>
-            ) : !availableProjects?.length ? (
-              <div className="text-center py-16 space-y-4">
-                <Database className="h-12 w-12 mx-auto text-muted-foreground/50" />
-                <div>
-                  <p className="text-lg font-medium">暂无数据</p>
-                  <p className="text-sm text-muted-foreground mt-1">点击右上角「同步数据」按钮从 GitHub 抓取项目</p>
-                </div>
-              </div>
-            ) : (
-              <>
-                <p className="text-sm text-muted-foreground">已加载 {availableProjects.length} 个项目</p>
-                <ProjectTable projects={availableProjects} tabStatus="available" onRequestLogin={() => setAuthDialogOpen(true)} />
-              </>
-            )}
-          </TabsContent>
+              <TabsContent value="available" className="space-y-4 mt-4">
+                {availableLoading ? (
+                  <div className="space-y-2">
+                    {Array.from({ length: 8 }).map((_, i) => (
+                      <div key={i} className="h-12 bg-muted rounded animate-pulse" />
+                    ))}
+                  </div>
+                ) : availableError ? (
+                  <div className="text-center py-12">
+                    <p className="text-destructive">加载失败: {(availableError as Error).message}</p>
+                    <Button variant="outline" onClick={() => refetchAvailable()} className="mt-4">重试</Button>
+                  </div>
+                ) : !availableProjects?.length ? (
+                  <div className="text-center py-16 space-y-4">
+                    <Database className="h-12 w-12 mx-auto text-muted-foreground/50" />
+                    <div>
+                      <p className="text-lg font-medium">暂无数据</p>
+                      <p className="text-sm text-muted-foreground mt-1">点击右上角「同步数据」按钮从 GitHub 抓取项目</p>
+                    </div>
+                  </div>
+                ) : (
+                  <>
+                    <p className="text-sm text-muted-foreground">已加载 {availableProjects.length} 个项目</p>
+                    <ProjectTable projects={availableProjects} tabStatus="available" onRequestLogin={() => setAuthDialogOpen(true)} />
+                  </>
+                )}
+              </TabsContent>
 
-          <TabsContent value="claimed" className="mt-4">
-            {claimedLoading ? (
-              <div className="space-y-2">
-                {Array.from({ length: 4 }).map((_, i) => (
-                  <div key={i} className="h-12 bg-muted rounded animate-pulse" />
-                ))}
-              </div>
-            ) : !claimedProjects?.length ? (
-              <div className="text-center py-16 text-muted-foreground">
-                <p>暂无认领中的项目</p>
-              </div>
-            ) : (
-              <ProjectTable projects={claimedProjects} tabStatus="claimed" />
-            )}
-          </TabsContent>
+              <TabsContent value="claimed" className="mt-4">
+                {claimedLoading ? (
+                  <div className="space-y-2">
+                    {Array.from({ length: 4 }).map((_, i) => (
+                      <div key={i} className="h-12 bg-muted rounded animate-pulse" />
+                    ))}
+                  </div>
+                ) : !claimedProjects?.length ? (
+                  <div className="text-center py-16 text-muted-foreground">
+                    <p>暂无认领中的项目</p>
+                  </div>
+                ) : (
+                  <ProjectTable projects={claimedProjects} tabStatus="claimed" />
+                )}
+              </TabsContent>
 
-          <TabsContent value="pr_submitted" className="mt-4">
-            {prLoading ? (
-              <div className="space-y-2">
-                {Array.from({ length: 4 }).map((_, i) => (
-                  <div key={i} className="h-12 bg-muted rounded animate-pulse" />
-                ))}
-              </div>
-            ) : !prProjects?.length ? (
-              <div className="text-center py-16 text-muted-foreground">
-                <p>暂无贡献中的项目</p>
-              </div>
-            ) : (
-              <ProjectTable projects={prProjects} tabStatus="pr_submitted" />
-            )}
-          </TabsContent>
+              <TabsContent value="pr_submitted" className="mt-4">
+                {prLoading ? (
+                  <div className="space-y-2">
+                    {Array.from({ length: 4 }).map((_, i) => (
+                      <div key={i} className="h-12 bg-muted rounded animate-pulse" />
+                    ))}
+                  </div>
+                ) : !prProjects?.length ? (
+                  <div className="text-center py-16 text-muted-foreground">
+                    <p>暂无贡献中的项目</p>
+                  </div>
+                ) : (
+                  <ProjectTable projects={prProjects} tabStatus="pr_submitted" />
+                )}
+              </TabsContent>
 
-          <TabsContent value="merged" className="mt-4">
-            {mergedLoading ? (
-              <div className="space-y-2">
-                {Array.from({ length: 4 }).map((_, i) => (
-                  <div key={i} className="h-12 bg-muted rounded animate-pulse" />
-                ))}
-              </div>
-            ) : !mergedProjects?.length ? (
-              <div className="text-center py-16 text-muted-foreground">
-                <p>暂无已完成的项目</p>
-              </div>
-            ) : (
-              <ProjectTable projects={mergedProjects} tabStatus="merged" />
-            )}
-          </TabsContent>
-        </Tabs>
+              <TabsContent value="merged" className="mt-4">
+                {mergedLoading ? (
+                  <div className="space-y-2">
+                    {Array.from({ length: 4 }).map((_, i) => (
+                      <div key={i} className="h-12 bg-muted rounded animate-pulse" />
+                    ))}
+                  </div>
+                ) : !mergedProjects?.length ? (
+                  <div className="text-center py-16 text-muted-foreground">
+                    <p>暂无已完成的项目</p>
+                  </div>
+                ) : (
+                  <ProjectTable projects={mergedProjects} tabStatus="merged" />
+                )}
+              </TabsContent>
+            </Tabs>
+          )}
+        </div>
       </main>
     </div>
   );
