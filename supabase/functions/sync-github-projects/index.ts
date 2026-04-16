@@ -32,7 +32,7 @@ const corsHeaders = {
 const GITHUB_API = 'https://api.github.com'
 const PER_PAGE = 30
 const MIN_COMPETITOR_HITS = 2        // ≥2 distinct brands required
-const FETCH_TIMEOUT_MS   = 10_000    // 10 s per outbound request
+const FETCH_TIMEOUT_MS   = 30_000    // 30 s per outbound request (guards against network jitter, not file size)
 const MAX_DIR_ENTRIES    = 200       // cap filename listing to avoid memory bloat
 
 // ── Search queries ───────────────────────────────────────────────────────────
