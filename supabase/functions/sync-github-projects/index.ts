@@ -1,7 +1,7 @@
 import { createClient } from 'npm:@supabase/supabase-js@2'
 
 /**
- * sync-github-projects — competitor-sourcing rule
+ * sync-github-projects — competitor-sourcing rule (incremental / weekly)
  *
  * Methodology: instead of accumulating weak LLM-provider signals, we search
  * the repo's README + dependency manifests + description for names of known
@@ -21,6 +21,9 @@ import { createClient } from 'npm:@supabase/supabase-js@2'
  *     noise).
  *   - Require ≥2 distinct competitor brands for inclusion (Leader-proposed).
  *   - Exclude repos already mentioning Qiniu (already integrated, not a target).
+ *
+ * Each run creates a sync_jobs record (job_type='incremental') and writes
+ * per-repo processing results to sync_repo_logs for full traceability.
  */
 
 const corsHeaders = {
@@ -31,9 +34,9 @@ const corsHeaders = {
 
 const GITHUB_API = 'https://api.github.com'
 const PER_PAGE = 30
-const MIN_COMPETITOR_HITS = 2        // ≥2 distinct brands required
-const FETCH_TIMEOUT_MS   = 30_000    // 30 s per outbound request (guards against network jitter, not file size)
-const MAX_DIR_ENTRIES    = 200       // cap filename listing to avoid memory bloat
+const MIN_COMPETITOR_HITS = 2
+const FETCH_TIMEOUT_MS   = 30_000
+const MAX_DIR_ENTRIES    = 200
 
 // ── Search queries ───────────────────────────────────────────────────────────
 const SEARCH_QUERIES = [
@@ -43,33 +46,29 @@ const SEARCH_QUERIES = [
 ]
 
 // ── Competitor list ──────────────────────────────────────────────────────────
-// Domestic MaaS
 const DOMESTIC_COMPETITORS = [
-  'siliconflow',          // 硅基流动
-  'dashscope',            // 阿里云百炼
-  'qianfan',              // 百度千帆
-  'zhipuai', 'zhipu',     // 智谱 AI
-  'minimax',              // MiniMax
-  'moonshot',             // 月之暗面 / Kimi
-  'volcengine',           // 字节跳动火山引擎
-  'lingyiwanwu',          // 零一万物
-  'baichuan',             // 百川智能
-  'stepfun',              // 阶跃星辰
+  'siliconflow',
+  'dashscope',
+  'qianfan',
+  'zhipuai', 'zhipu',
+  'minimax',
+  'moonshot',
+  'volcengine',
+  'lingyiwanwu',
+  'baichuan',
+  'stepfun',
 ]
 
-// International tier-2
 const INTL_COMPETITORS = [
   'togetherai', 'together.ai',
   'fireworks ai', 'fireworks.ai',
   'openrouter',
   'deepinfra',
   'novita',
-  'nousresearch',         // Nous Research portal
-  'xiaomi',               // Xiaomi MiMo API platform
+  'nousresearch',
+  'xiaomi',
 ]
 
-// Short dot-separated terms that need word-boundary matching to avoid
-// false hits in hostnames like amz.ai or myz.ai-client.
 const DOTAI_COMPETITORS = ['z.ai']
 
 const ALL_COMPETITORS = [...new Set([
@@ -79,13 +78,9 @@ const ALL_COMPETITORS = [...new Set([
 ])]
 
 // ── Qiniu exclusion ──────────────────────────────────────────────────────────
-const QINIU_TERMS = [
-  'qiniu',
-  '七牛',
-]
+const QINIU_TERMS = ['qiniu', '七牛']
 
 // ── Brand canonicalization ───────────────────────────────────────────────────
-// Aliases of the same brand count as one hit toward the ≥2 threshold.
 function canonicalBrand(term: string): string {
   if (term === 'zhipuai' || term === 'zhipu' || term === 'z.ai') return 'zhipu'
   if (term === 'togetherai' || term === 'together.ai') return 'together'
@@ -94,8 +89,6 @@ function canonicalBrand(term: string): string {
 }
 
 // ── Word-boundary-aware matching ─────────────────────────────────────────────
-// `z.ai` must not match inside hostnames like `amz.ai`. Require a non-alnum
-// boundary on both sides.
 const BOUNDARY_TERMS = new Set(DOTAI_COMPETITORS.map(t => t.toLowerCase()))
 
 function matchesTerm(haystack: string, term: string): boolean {
@@ -144,13 +137,6 @@ function makeAbortSignal(): AbortSignal {
   return AbortSignal.timeout(FETCH_TIMEOUT_MS)
 }
 
-/**
- * Fetch a GitHub API endpoint.
- * - Returns null for expected non-2xx responses (404, etc.).
- * - Throws on 403/429 so rate-limit errors propagate to the caller and abort
- *   the run with a clear error message instead of silently shrinking results.
- * - Returns null (logs warning) on network/timeout errors.
- */
 async function fetchGitHub(path: string, token: string): Promise<any> {
   let res: Response
   try {
@@ -178,7 +164,6 @@ async function fetchGitHub(path: string, token: string): Promise<any> {
   return res.json()
 }
 
-/** Fetch raw text from any URL; returns '' on error or timeout. */
 async function fetchText(url: string): Promise<string> {
   try {
     const res = await fetch(url, {
@@ -193,9 +178,6 @@ async function fetchText(url: string): Promise<string> {
 }
 
 // ── Provider-directory scanning ──────────────────────────────────────────────
-// Projects like openclaw store their provider list under docs/providers/*.md.
-// We list each candidate directory (filenames alone carry the provider name)
-// and try to fetch a summary index file (index.md / README.md).
 
 const PROVIDER_DIR_CANDIDATES = [
   'docs/providers',
@@ -219,7 +201,6 @@ async function fetchProviderDirs(repo: GitHubRepo, token: string): Promise<strin
     )
     if (!Array.isArray(listing)) continue
 
-    // Cap entries to avoid memory bloat from unusually large directories.
     const filenames = listing
       .slice(0, MAX_DIR_ENTRIES)
       .map((f: { name: string }) => f.name)
@@ -317,13 +298,30 @@ Deno.serve(async (req) => {
 
     const supabase = createClient(supabaseUrl, supabaseKey)
 
-    // ── 1. Candidate discovery ───────────────────────────────────────────────
+    // ── Create job record ────────────────────────────────────────────────────
     const since = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
+
+    const { data: jobRecord, error: jobCreateErr } = await supabase
+      .from('sync_jobs')
+      .insert({
+        job_type: 'incremental',
+        status: 'running',
+        search_queries: SEARCH_QUERIES.map(q => `${q} created:>${since}`),
+        time_window_since: since,
+        competitor_list: ALL_COMPETITORS,
+        min_competitor_hits: MIN_COMPETITOR_HITS,
+      })
+      .select('id')
+      .single()
+
+    if (jobCreateErr) throw jobCreateErr
+    const jobId: string = jobRecord.id
+
+    // ── 1. Candidate discovery ───────────────────────────────────────────────
     const allRepos = new Map<number, GitHubRepo>()
 
     for (const query of SEARCH_QUERIES) {
       const q = `${query} created:>${since}`
-      // Rate-limit errors from fetchGitHub propagate here → top-level catch → 500.
       const data = await fetchGitHub(
         `/search/repositories?q=${encodeURIComponent(q)}&sort=stars&order=desc&per_page=${PER_PAGE}&page=1`,
         githubToken
@@ -345,16 +343,57 @@ Deno.serve(async (req) => {
     let repoErrors = 0
     let inserted = 0
 
-    for (const repo of allRepos.values()) {
-      if (repo.archived) continue
+    const repoLogs: Array<{
+      sync_job_id: string
+      repo_full_name: string
+      github_id: number
+      stars: number
+      language: string | null
+      search_query: null
+      result: string
+      reject_reason: string | null
+      matched_terms: string[]
+      distinct_brands: string[]
+      hit_count: number
+    }> = []
 
-      // Isolate per-repo fetch errors so one bad repo doesn't abort the run.
+    for (const repo of allRepos.values()) {
+      if (repo.archived) {
+        repoLogs.push({
+          sync_job_id: jobId,
+          repo_full_name: repo.full_name,
+          github_id: repo.id,
+          stars: repo.stargazers_count,
+          language: repo.language,
+          search_query: null,
+          result: 'skipped_archived',
+          reject_reason: null,
+          matched_terms: [],
+          distinct_brands: [],
+          hit_count: 0,
+        })
+        continue
+      }
+
       let content = ''
       try {
         content = await fetchRepoContent(repo, githubToken)
       } catch (err) {
         console.error(`Error fetching ${repo.full_name}:`, (err as Error).message)
         repoErrors++
+        repoLogs.push({
+          sync_job_id: jobId,
+          repo_full_name: repo.full_name,
+          github_id: repo.id,
+          stars: repo.stargazers_count,
+          language: repo.language,
+          search_query: null,
+          result: 'error',
+          reject_reason: (err as Error).message,
+          matched_terms: [],
+          distinct_brands: [],
+          hit_count: 0,
+        })
         continue
       }
 
@@ -370,11 +409,37 @@ Deno.serve(async (req) => {
 
       if (match.hit_count < MIN_COMPETITOR_HITS) {
         if (match.hit_count === 1) singleHitRejected++
+        repoLogs.push({
+          sync_job_id: jobId,
+          repo_full_name: repo.full_name,
+          github_id: repo.id,
+          stars: repo.stargazers_count,
+          language: repo.language,
+          search_query: null,
+          result: 'rejected',
+          reject_reason: 'low_hits',
+          matched_terms: match.matched_terms,
+          distinct_brands: match.distinct_brands,
+          hit_count: match.hit_count,
+        })
         continue
       }
 
       if (hasQiniuAlready(haystack)) {
         qiniuAlreadySkipped++
+        repoLogs.push({
+          sync_job_id: jobId,
+          repo_full_name: repo.full_name,
+          github_id: repo.id,
+          stars: repo.stargazers_count,
+          language: repo.language,
+          search_query: null,
+          result: 'skipped_qiniu',
+          reject_reason: null,
+          matched_terms: match.matched_terms,
+          distinct_brands: match.distinct_brands,
+          hit_count: match.hit_count,
+        })
         continue
       }
 
@@ -388,6 +453,19 @@ Deno.serve(async (req) => {
 
       if (existing) {
         skippedExisting++
+        repoLogs.push({
+          sync_job_id: jobId,
+          repo_full_name: repo.full_name,
+          github_id: repo.id,
+          stars: repo.stargazers_count,
+          language: repo.language,
+          search_query: null,
+          result: 'skipped_existing',
+          reject_reason: null,
+          matched_terms: match.matched_terms,
+          distinct_brands: match.distinct_brands,
+          hit_count: match.hit_count,
+        })
         continue
       }
 
@@ -412,13 +490,47 @@ Deno.serve(async (req) => {
         last_synced_at: new Date().toISOString(),
       })
 
-      if (!insertErr) inserted++
+      if (!insertErr) {
+        inserted++
+        repoLogs.push({
+          sync_job_id: jobId,
+          repo_full_name: repo.full_name,
+          github_id: repo.id,
+          stars: repo.stargazers_count,
+          language: repo.language,
+          search_query: null,
+          result: 'accepted',
+          reject_reason: null,
+          matched_terms: match.matched_terms,
+          distinct_brands: match.distinct_brands,
+          hit_count: match.hit_count,
+        })
+      }
 
       await new Promise(r => setTimeout(r, 100))
     }
 
+    // ── Flush repo logs ──────────────────────────────────────────────────────
+    if (repoLogs.length > 0) {
+      await supabase.from('sync_repo_logs').insert(repoLogs)
+    }
+
+    // ── Complete job record ──────────────────────────────────────────────────
+    await supabase.from('sync_jobs').update({
+      status: 'completed',
+      finished_at: new Date().toISOString(),
+      total_scanned: scanned,
+      total_inserted: inserted,
+      total_accepted: accepted,
+      total_rejected: singleHitRejected,
+      total_skipped_existing: skippedExisting,
+      total_skipped_qiniu: qiniuAlreadySkipped,
+      total_errors: repoErrors,
+    }).eq('id', jobId)
+
     return new Response(JSON.stringify({
       success: true,
+      job_id: jobId,
       since,
       total_found: allRepos.size,
       scanned,
@@ -435,7 +547,6 @@ Deno.serve(async (req) => {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
     })
   } catch (error) {
-    // Top-level: catches rate-limit throws from fetchGitHub.
     console.error('Sync error:', error)
     return new Response(JSON.stringify({ error: (error as Error).message }), {
       status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' },

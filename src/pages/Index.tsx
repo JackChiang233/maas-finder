@@ -17,6 +17,7 @@ import { useAuthContext } from "@/contexts/AuthContext";
 import { toast } from "sonner";
 import type { TabStatus } from "@/components/ProjectCard";
 import { AddProjectDialog } from "@/components/AddProjectDialog";
+import { SyncLogsPanel } from "@/components/SyncLogsPanel";
 
 const Index = () => {
   const { user, loading: authLoading, signOut } = useAuthContext();
@@ -217,6 +218,13 @@ const Index = () => {
                 <p className="text-xs text-muted-foreground">项目分类</p>
               </div>
             </div>
+          </div>
+        )}
+
+        {isAdmin && (
+          <div className="space-y-3">
+            <h2 className="text-sm font-semibold text-muted-foreground uppercase tracking-wide">同步日志</h2>
+            <SyncLogsPanel />
           </div>
         )}
 

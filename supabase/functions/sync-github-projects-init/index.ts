@@ -12,7 +12,8 @@ import { createClient } from 'npm:@supabase/supabase-js@2'
  *   2. If none exists, return immediately (cron will keep calling but noop).
  *   3. Fetch one page of one query, run competitor scan.
  *   4. Insert only NEW repos (skip existing github_ids).
- *   5. Advance progress. If all queries + pages are exhausted, mark completed.
+ *   5. Write per-repo logs to sync_repo_logs.
+ *   6. Advance progress. If all queries + pages are exhausted, mark completed.
  */
 
 const corsHeaders = {
@@ -64,6 +65,8 @@ const INTL_COMPETITORS = [
 ]
 
 const ALL_COMPETITORS = [...new Set([...DOMESTIC_COMPETITORS, ...INTL_COMPETITORS])]
+
+const QINIU_TERMS = ['qiniu', '七牛']
 
 function canonicalBrand(term: string): string {
   if (term === 'zhipuai' || term === 'zhipu') return 'zhipu'
@@ -150,6 +153,11 @@ function scanCompetitors(haystack: string): { matched_terms: string[]; distinct_
   return { matched_terms, distinct_brands, hit_count: distinct_brands.length }
 }
 
+function hasQiniuAlready(haystack: string): boolean {
+  const lower = haystack.toLowerCase()
+  return QINIU_TERMS.some(t => lower.includes(t.toLowerCase()))
+}
+
 Deno.serve(async (req) => {
   if (req.method === 'OPTIONS') {
     return new Response(null, { status: 200, headers: corsHeaders })
@@ -160,7 +168,7 @@ Deno.serve(async (req) => {
     const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
     const supabase = createClient(supabaseUrl, supabaseKey)
 
-    // ?action=start or x-action: start header — create a new init job record (bypasses client-side RLS)
+    // ?action=start — create a new init job record
     const url = new URL(req.url)
     const isStart = url.searchParams.get('action') === 'start' || req.headers.get('x-action') === 'start'
     if (isStart) {
@@ -179,7 +187,13 @@ Deno.serve(async (req) => {
 
       const { data: newJob, error: createErr } = await supabase
         .from('sync_jobs')
-        .insert({ job_type: 'init', status: 'running' })
+        .insert({
+          job_type: 'init',
+          status: 'running',
+          search_queries: SEARCH_QUERIES,
+          competitor_list: ALL_COMPETITORS,
+          min_competitor_hits: MIN_COMPETITOR_HITS,
+        })
         .select()
         .single()
 
@@ -215,6 +229,15 @@ Deno.serve(async (req) => {
       })
     }
 
+    // Back-fill search_queries if this job was created before logging was added
+    if (!job.search_queries || job.search_queries.length === 0) {
+      await supabase.from('sync_jobs').update({
+        search_queries: SEARCH_QUERIES,
+        competitor_list: ALL_COMPETITORS,
+        min_competitor_hits: MIN_COMPETITOR_HITS,
+      }).eq('id', job.id)
+    }
+
     const queryIndex: number = job.current_query_index
     const page: number = job.current_page
 
@@ -243,17 +266,108 @@ Deno.serve(async (req) => {
 
     let batchScanned = 0
     let batchInserted = 0
+    let batchAccepted = 0
+    let batchRejected = 0
+    let batchSkippedExisting = 0
+    let batchSkippedQiniu = 0
+    let batchErrors = 0
+
+    const repoLogs: Array<{
+      sync_job_id: string
+      repo_full_name: string
+      github_id: number
+      stars: number
+      language: string | null
+      search_query: string
+      result: string
+      reject_reason: string | null
+      matched_terms: string[]
+      distinct_brands: string[]
+      hit_count: number
+    }> = []
 
     for (const repo of items) {
-      if (repo.archived) continue
+      if (repo.archived) {
+        repoLogs.push({
+          sync_job_id: job.id,
+          repo_full_name: repo.full_name,
+          github_id: repo.id,
+          stars: repo.stargazers_count,
+          language: repo.language,
+          search_query: query,
+          result: 'skipped_archived',
+          reject_reason: null,
+          matched_terms: [],
+          distinct_brands: [],
+          hit_count: 0,
+        })
+        continue
+      }
 
-      const content = await fetchRepoContent(repo, githubToken)
+      let content = ''
+      try {
+        content = await fetchRepoContent(repo, githubToken)
+      } catch (err) {
+        console.error(`Error fetching ${repo.full_name}:`, (err as Error).message)
+        batchErrors++
+        repoLogs.push({
+          sync_job_id: job.id,
+          repo_full_name: repo.full_name,
+          github_id: repo.id,
+          stars: repo.stargazers_count,
+          language: repo.language,
+          search_query: query,
+          result: 'error',
+          reject_reason: (err as Error).message,
+          matched_terms: [],
+          distinct_brands: [],
+          hit_count: 0,
+        })
+        continue
+      }
+
       batchScanned++
 
       const haystack = [repo.description || '', (repo.topics || []).join(' '), content].join('\n')
       const match = scanCompetitors(haystack)
 
-      if (match.hit_count < MIN_COMPETITOR_HITS) continue
+      if (match.hit_count < MIN_COMPETITOR_HITS) {
+        batchRejected++
+        repoLogs.push({
+          sync_job_id: job.id,
+          repo_full_name: repo.full_name,
+          github_id: repo.id,
+          stars: repo.stargazers_count,
+          language: repo.language,
+          search_query: query,
+          result: 'rejected',
+          reject_reason: 'low_hits',
+          matched_terms: match.matched_terms,
+          distinct_brands: match.distinct_brands,
+          hit_count: match.hit_count,
+        })
+        continue
+      }
+
+      if (hasQiniuAlready(haystack)) {
+        batchSkippedQiniu++
+        repoLogs.push({
+          sync_job_id: job.id,
+          repo_full_name: repo.full_name,
+          github_id: repo.id,
+          stars: repo.stargazers_count,
+          language: repo.language,
+          search_query: query,
+          result: 'skipped_qiniu',
+          reject_reason: null,
+          matched_terms: match.matched_terms,
+          distinct_brands: match.distinct_brands,
+          hit_count: match.hit_count,
+        })
+        continue
+      }
+
+      batchAccepted++
 
       // Check if already exists
       const { data: existing } = await supabase
@@ -262,7 +376,23 @@ Deno.serve(async (req) => {
         .eq('github_id', repo.id)
         .maybeSingle()
 
-      if (existing) continue
+      if (existing) {
+        batchSkippedExisting++
+        repoLogs.push({
+          sync_job_id: job.id,
+          repo_full_name: repo.full_name,
+          github_id: repo.id,
+          stars: repo.stargazers_count,
+          language: repo.language,
+          search_query: query,
+          result: 'skipped_existing',
+          reject_reason: null,
+          matched_terms: match.matched_terms,
+          distinct_brands: match.distinct_brands,
+          hit_count: match.hit_count,
+        })
+        continue
+      }
 
       const { error: insertErr } = await supabase.from('github_projects').insert({
         github_id: repo.id,
@@ -285,9 +415,29 @@ Deno.serve(async (req) => {
         last_synced_at: new Date().toISOString(),
       })
 
-      if (!insertErr) batchInserted++
+      if (!insertErr) {
+        batchInserted++
+        repoLogs.push({
+          sync_job_id: job.id,
+          repo_full_name: repo.full_name,
+          github_id: repo.id,
+          stars: repo.stargazers_count,
+          language: repo.language,
+          search_query: query,
+          result: 'accepted',
+          reject_reason: null,
+          matched_terms: match.matched_terms,
+          distinct_brands: match.distinct_brands,
+          hit_count: match.hit_count,
+        })
+      }
 
       await new Promise(r => setTimeout(r, 100))
+    }
+
+    // Flush repo logs in one batch
+    if (repoLogs.length > 0) {
+      await supabase.from('sync_repo_logs').insert(repoLogs)
     }
 
     // Advance progress
@@ -301,6 +451,11 @@ Deno.serve(async (req) => {
       current_page: nextPage,
       total_scanned: job.total_scanned + batchScanned,
       total_inserted: job.total_inserted + batchInserted,
+      total_accepted: (job.total_accepted ?? 0) + batchAccepted,
+      total_rejected: (job.total_rejected ?? 0) + batchRejected,
+      total_skipped_existing: (job.total_skipped_existing ?? 0) + batchSkippedExisting,
+      total_skipped_qiniu: (job.total_skipped_qiniu ?? 0) + batchSkippedQiniu,
+      total_errors: (job.total_errors ?? 0) + batchErrors,
       ...(isFinished ? { status: 'completed', finished_at: new Date().toISOString() } : {}),
     }).eq('id', job.id)
 
@@ -310,6 +465,11 @@ Deno.serve(async (req) => {
       page,
       batch_scanned: batchScanned,
       batch_inserted: batchInserted,
+      batch_accepted: batchAccepted,
+      batch_rejected: batchRejected,
+      batch_skipped_existing: batchSkippedExisting,
+      batch_skipped_qiniu: batchSkippedQiniu,
+      batch_errors: batchErrors,
       total_scanned: job.total_scanned + batchScanned,
       total_inserted: job.total_inserted + batchInserted,
       next_query_index: nextQueryIndex,

@@ -9,13 +9,22 @@ export interface SyncJob {
   current_page: number;
   total_scanned: number;
   total_inserted: number;
+  total_accepted: number;
+  total_rejected: number;
+  total_skipped_existing: number;
+  total_skipped_qiniu: number;
+  total_errors: number;
+  search_queries: string[];
+  time_window_since: string | null;
+  competitor_list: string[];
+  min_competitor_hits: number;
   started_at: string;
   finished_at: string | null;
   error_message: string | null;
   created_at: string;
 }
 
-const TOTAL_QUERIES = 12;
+const TOTAL_QUERIES = 14;
 const MAX_PAGES = 10;
 const TOTAL_WORK_UNITS = TOTAL_QUERIES * MAX_PAGES;
 
@@ -47,6 +56,22 @@ export function useActiveInitJob() {
   });
 }
 
+export function useSyncJobList() {
+  return useQuery({
+    queryKey: ["sync-job-list"],
+    queryFn: async () => {
+      const { data, error } = await supabase
+        .from("sync_jobs")
+        .select("*")
+        .order("created_at", { ascending: false })
+        .limit(50);
+      if (error) throw error;
+      return data as SyncJob[];
+    },
+    staleTime: 10_000,
+  });
+}
+
 export function useStartInitJob() {
   const qc = useQueryClient();
   return useMutation({
@@ -61,6 +86,7 @@ export function useStartInitJob() {
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["sync-job-init"] });
+      qc.invalidateQueries({ queryKey: ["sync-job-list"] });
     },
   });
 }
