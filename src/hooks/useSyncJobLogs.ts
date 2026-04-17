@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { useState, useCallback, useEffect } from "react";
 import { supabase } from "@/integrations/supabase/client";
 
 export interface SyncRepoLog {
@@ -19,25 +19,61 @@ export interface SyncRepoLog {
 
 export type RepoLogResult = "all" | "accepted" | "rejected" | "skipped_existing" | "skipped_qiniu" | "skipped_archived" | "error";
 
+const PAGE_SIZE = 200;
+
 export function useSyncJobLogs(jobId: string | null, resultFilter: RepoLogResult = "all") {
-  return useQuery({
-    queryKey: ["sync-repo-logs", jobId, resultFilter],
-    queryFn: async () => {
-      if (!jobId) return [];
-      let q = supabase
-        .from("sync_repo_logs")
-        .select("*")
-        .eq("sync_job_id", jobId)
-        .order("created_at", { ascending: true })
-        .limit(500);
-      if (resultFilter !== "all") {
-        q = q.eq("result", resultFilter);
-      }
-      const { data, error } = await q;
-      if (error) throw error;
-      return data as SyncRepoLog[];
-    },
-    enabled: !!jobId,
-    staleTime: 30_000,
-  });
+  const [logs, setLogs] = useState<SyncRepoLog[]>([]);
+  const [isLoading, setIsLoading] = useState(false);
+  const [isFetchingMore, setIsFetchingMore] = useState(false);
+  const [hasMore, setHasMore] = useState(false);
+  const [page, setPage] = useState(0);
+
+  const fetchPage = useCallback(async (pageIndex: number, filter: RepoLogResult, append: boolean) => {
+    if (!jobId) return;
+    const start = pageIndex * PAGE_SIZE;
+    const end = start + PAGE_SIZE - 1;
+
+    let q = supabase
+      .from("sync_repo_logs")
+      .select("*")
+      .eq("sync_job_id", jobId)
+      .order("created_at", { ascending: true })
+      .range(start, end);
+
+    if (filter !== "all") {
+      q = q.eq("result", filter);
+    }
+
+    const { data, error } = await q;
+    if (error) throw error;
+
+    const rows = (data ?? []) as SyncRepoLog[];
+    if (append) {
+      setLogs((prev) => [...prev, ...rows]);
+    } else {
+      setLogs(rows);
+    }
+    setHasMore(rows.length === PAGE_SIZE);
+    setPage(pageIndex);
+  }, [jobId]);
+
+  useEffect(() => {
+    if (!jobId) return;
+    setIsLoading(true);
+    setLogs([]);
+    setPage(0);
+    setHasMore(false);
+    fetchPage(0, resultFilter, false).finally(() => setIsLoading(false));
+  }, [jobId, resultFilter, fetchPage]);
+
+  const fetchNextPage = useCallback(async () => {
+    setIsFetchingMore(true);
+    try {
+      await fetchPage(page + 1, resultFilter, true);
+    } finally {
+      setIsFetchingMore(false);
+    }
+  }, [fetchPage, page, resultFilter]);
+
+  return { data: logs, isLoading, isFetchingMore, hasMore, fetchNextPage };
 }

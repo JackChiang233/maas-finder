@@ -38,7 +38,7 @@ const FILTER_OPTIONS: { value: RepoLogResult; label: string }[] = [
 
 function JobRepoLogs({ jobId }: { jobId: string }) {
   const [resultFilter, setResultFilter] = useState<RepoLogResult>("all");
-  const { data: logs, isLoading } = useSyncJobLogs(jobId, resultFilter);
+  const { data: logs, isLoading, isFetchingMore, hasMore, fetchNextPage } = useSyncJobLogs(jobId, resultFilter);
 
   return (
     <div className="mt-3 space-y-3">
@@ -119,11 +119,22 @@ function JobRepoLogs({ jobId }: { jobId: string }) {
               })}
             </tbody>
           </table>
-          {logs.length >= 500 && (
-            <p className="text-xs text-muted-foreground text-center py-2 border-t bg-muted/30">
-              显示前 500 条
-            </p>
-          )}
+          <div className="border-t bg-muted/30 px-3 py-2 flex items-center justify-between">
+            <span className="text-xs text-muted-foreground">已加载 {logs.length} 条</span>
+            {hasMore ? (
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-7 text-xs"
+                onClick={fetchNextPage}
+                disabled={isFetchingMore}
+              >
+                {isFetchingMore ? "加载中..." : "加载更多"}
+              </Button>
+            ) : (
+              <span className="text-xs text-muted-foreground">已全部加载</span>
+            )}
+          </div>
         </div>
       )}
     </div>
